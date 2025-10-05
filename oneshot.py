@@ -435,7 +435,8 @@ class Companion:
 
     def __init_wpa_supplicant(self):
         print('[*] Running wpa_supplicant…')
-        cmd = 'wpa_supplicant -K -d -Dnl80211,wext,hostapd,wired -i{} -c{}'.format(self.interface, self.tempconf)
+        wpas_cmd = 'wpa_supplicant -K -d -Dnl80211,wext,hostapd,wired -i{} -c{}'.format(self.interface, self.tempconf)
+        cmd = f'su -c "{wpas_cmd}"'
         self.wpas = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, encoding='utf-8', errors='replace')
         # Waiting for wpa_supplicant control interface initialization
@@ -444,6 +445,11 @@ class Companion:
             if ret is not None and ret != 0:
                 raise ValueError('wpa_supplicant returned an error: ' + self.wpas.communicate()[0])
             if os.path.exists(self.wpas_ctrl_path):
+                # The socket is created by root, so we need to make it accessible
+                chmod_cmd = f'su -c "chmod 777 {self.wpas_ctrl_path}"'
+                res = subprocess.run(chmod_cmd, shell=True, capture_output=True, encoding='utf-8')
+                if res.returncode != 0:
+                    die(f"Failed to change permissions for wpa_supplicant socket: {res.stderr}")
                 break
             time.sleep(.1)
 
@@ -913,7 +919,8 @@ class WiFiScanner:
             d = result.group(1)
             networks[-1]['Device name'] = codecs.decode(d, 'unicode-escape').encode('latin1').decode('utf-8', errors='replace')
 
-        cmd = 'iw dev {} scan'.format(self.interface)
+        iw_cmd = 'iw dev {} scan'.format(self.interface)
+        cmd = f'su -c "{iw_cmd}"'
         proc = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, encoding='utf-8', errors='replace')
         lines = proc.stdout.splitlines()
@@ -1038,7 +1045,8 @@ def ifaceUp(iface, down=False):
         action = 'down'
     else:
         action = 'up'
-    cmd = 'ip link set {} {}'.format(iface, action)
+    ip_cmd = 'ip link set {} {}'.format(iface, action)
+    cmd = f'su -c "{ip_cmd}"'
     res = subprocess.run(cmd, shell=True, stdout=sys.stdout, stderr=sys.stdout)
     if res.returncode == 0:
         return True
@@ -1182,16 +1190,27 @@ if __name__ == '__main__':
 
     if sys.hexversion < 0x03060F0:
         die("The program requires Python 3.6 and above")
-    if os.getuid() != 0:
-        die("Run it as root")
+
+    # Check for root and dependencies
+    if not shutil.which('su'):
+        die("This script requires root access. Please install 'su' (e.g., via Magisk).")
+    for dep in ['wpa_supplicant', 'iw', 'pixiewps']:
+        if not shutil.which(dep):
+            die(f"Required dependency '{dep}' not found in PATH.")
 
     if args.mtk_wifi:
-        wmtWifi_device = Path("/dev/wmtWifi")
-        if not wmtWifi_device.is_char_device():
+        # Check if the device exists and is a character device using su
+        check_cmd = 'su -c "[ -c /dev/wmtWifi ]"'
+        res = subprocess.run(check_cmd, shell=True, capture_output=True)
+        if res.returncode != 0:
             die("Unable to activate MediaTek Wi-Fi interface device (--mtk-wifi): "
                 "/dev/wmtWifi does not exist or it is not a character device")
-        wmtWifi_device.chmod(0o644)
-        wmtWifi_device.write_text("1")
+
+        # Activate the adapter
+        activate_cmd = 'su -c "echo 1 > /dev/wmtWifi"'
+        res = subprocess.run(activate_cmd, shell=True, capture_output=True, encoding='utf-8')
+        if res.returncode != 0:
+            die(f"Failed to activate MediaTek Wi-Fi interface: {res.stderr}")
 
     if not ifaceUp(args.interface):
         die('Unable to up interface "{}"'.format(args.interface))
@@ -1239,4 +1258,8 @@ if __name__ == '__main__':
         ifaceUp(args.interface, down=True)
 
     if args.mtk_wifi:
-        wmtWifi_device.write_text("0")
+        deactivate_cmd = 'su -c "echo 0 > /dev/wmtWifi"'
+        res = subprocess.run(deactivate_cmd, shell=True, capture_output=True, encoding='utf-8')
+        if res.returncode != 0:
+            # Use print instead of die because the script is already exiting
+            print(f"[!] Failed to deactivate MediaTek Wi-Fi interface: {res.stderr}")
