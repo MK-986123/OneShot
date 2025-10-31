@@ -471,8 +471,8 @@ def get_hex(line):
 
 
 class PixiewpsData:
-    def __init__(self, pixie_binary=None):
-        self.pixiewps_binary = pixie_binary or 'pixiewps'
+    def __init__(self):
+        self.pixiewps_binary = 'pixiewps'
         self._reset_state()
 
     def _reset_state(self):
