@@ -10,6 +10,7 @@ import codecs
 import socket
 import pathlib
 import time
+import shlex
 from datetime import datetime
 import collections
 import statistics
@@ -17,6 +18,146 @@ import csv
 from pathlib import Path
 from typing import Dict
 import wcwidth
+
+
+def die(msg):
+    sys.stderr.write(msg + '\n')
+    sys.exit(1)
+
+ADDITIONAL_BINARY_DIRS = ('/system/bin', '/system/xbin', '/vendor/bin')
+TERMUX_PACKAGE_HINTS = {
+    'wpa_supplicant': 'wpa-supplicant',
+    'iw': 'iw',
+    'pixiewps': 'pixiewps',
+    'ip': 'iproute2',
+    'ifconfig': 'net-tools',
+}
+_TOOL_CACHE = {}
+
+ROOT_WRAPPER_CANDIDATES = ('su', 'tsu', 'sudo')
+
+
+def natural_language_join(items):
+    items = [item for item in items if item]
+    if not items:
+        return ''
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return '{0} or {1}'.format(items[0], items[1])
+    return ', '.join(items[:-1]) + ', or ' + items[-1]
+
+
+
+def is_termux_environment():
+    prefix = os.environ.get('PREFIX', '')
+    home = os.environ.get('HOME', '')
+    return (
+        'com.termux' in prefix
+        or 'com.termux' in home
+        or 'TERMUX_VERSION' in os.environ
+    )
+
+
+IS_TERMUX = is_termux_environment()
+
+
+def extend_termux_path():
+    if not IS_TERMUX:
+        return
+    path = os.environ.get('PATH', '')
+    parts = [p for p in path.split(os.pathsep) if p] if path else []
+    updated = False
+    for extra in ADDITIONAL_BINARY_DIRS:
+        if extra and extra not in parts and os.path.isdir(extra):
+            parts.append(extra)
+            updated = True
+    if updated:
+        os.environ['PATH'] = os.pathsep.join(parts)
+
+
+extend_termux_path()
+
+
+def resolve_binary(name):
+    if name in _TOOL_CACHE:
+        return _TOOL_CACHE[name]
+    path = shutil.which(name)
+    if not path:
+        for folder in ADDITIONAL_BINARY_DIRS:
+            candidate = os.path.join(folder, name)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                path = candidate
+                break
+    _TOOL_CACHE[name] = path
+    return path
+
+
+def detect_available_root_wrappers():
+    wrappers = []
+    for name in ROOT_WRAPPER_CANDIDATES:
+        if resolve_binary(name):
+            wrappers.append(name)
+    return wrappers
+
+
+def ensure_tool(name, purpose=None):
+    path = resolve_binary(name)
+    if path:
+        return path
+    message = f'Unable to find required executable "{name}".'
+    if purpose:
+        message += f' {purpose}'
+    if IS_TERMUX:
+        package = TERMUX_PACKAGE_HINTS.get(name)
+        if package:
+            message += f' In Termux you can install it with: pkg install {package}'
+    die(message)
+
+
+def has_root_privileges():
+    uid_getters = [getattr(os, 'geteuid', None), getattr(os, 'getuid', None)]
+    for getter in uid_getters:
+        if getter is None:
+            continue
+        try:
+            if getter() == 0:
+                return True
+        except OSError:
+            continue
+    try:
+        proc = subprocess.run(
+            ['id', '-u'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
+    return proc.returncode == 0 and proc.stdout.strip() == '0'
+
+
+def require_root():
+    if has_root_privileges():
+        return
+    hint = 'Run it as root'
+    if IS_TERMUX:
+        wrappers = detect_available_root_wrappers()
+        suggestions = []
+        for wrapper in wrappers:
+            if wrapper == 'su':
+                suggestions.append('`su -c`')
+            else:
+                suggestions.append(f'`{wrapper}`')
+        if suggestions:
+            hint += ' (use ' + natural_language_join(suggestions) + ' inside Termux)'
+        else:
+            hint += ' (install `tsu` or ensure Magisk `su` is available)'
+    die(hint)
+
 
 
 class NetworkAddress:
@@ -331,6 +472,10 @@ def get_hex(line):
 
 class PixiewpsData:
     def __init__(self):
+        self.pixiewps_binary = 'pixiewps'
+        self._reset_state()
+
+    def _reset_state(self):
         self.pke = ''
         self.pkr = ''
         self.e_hash1 = ''
@@ -339,20 +484,29 @@ class PixiewpsData:
         self.e_nonce = ''
 
     def clear(self):
-        self.__init__()
+        self._reset_state()
+
+    def set_binary(self, path):
+        self.pixiewps_binary = path
 
     def got_all(self):
         return (self.pke and self.pkr and self.e_nonce and self.authkey
                 and self.e_hash1 and self.e_hash2)
 
     def get_pixie_cmd(self, full_range=False):
-        pixiecmd = "pixiewps --pke {} --pkr {} --e-hash1 {}"\
-                    " --e-hash2 {} --authkey {} --e-nonce {}".format(
-                    self.pke, self.pkr, self.e_hash1,
-                    self.e_hash2, self.authkey, self.e_nonce)
+        parts = [
+            self.pixiewps_binary,
+            '--pke', self.pke,
+            '--pkr', self.pkr,
+            '--e-hash1', self.e_hash1,
+            '--e-hash2', self.e_hash2,
+            '--authkey', self.authkey,
+            '--e-nonce', self.e_nonce,
+        ]
         if full_range:
-            pixiecmd += ' --force'
-        return pixiecmd
+            parts.append('--force')
+        return ' '.join(shlex.quote(part) for part in parts)
+
 
 
 class ConnectionStatus:
@@ -409,6 +563,11 @@ class Companion:
         self.save_result = save_result
         self.print_debug = print_debug
 
+        self.wpa_supplicant_path = ensure_tool(
+            'wpa_supplicant',
+            'wpa_supplicant is required to communicate with the wireless interface.'
+        )
+
         self.tempdir = tempfile.mkdtemp()
         with tempfile.NamedTemporaryFile(mode='w', suffix='.conf', delete=False) as temp:
             temp.write('ctrl_interface={}\nctrl_interface_group=root\nupdate_config=1\n'.format(self.tempdir))
@@ -439,7 +598,10 @@ class Companion:
 
     def __init_wpa_supplicant(self):
         print('[*] Running wpa_supplicant…')
-        cmd = 'wpa_supplicant -K -d -Dnl80211,wext,hostapd,wired -i{} -c{}'.format(self.interface, self.tempconf)
+        cmd = (
+            f"{shlex.quote(self.wpa_supplicant_path)} -K -d -Dnl80211,wext,hostapd,wired "
+            f"-i {shlex.quote(self.interface)} -c {shlex.quote(self.tempconf)}"
+        )
         self.wpas = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, encoding='utf-8', errors='replace')
         # Waiting for wpa_supplicant control interface initialization
@@ -582,6 +744,11 @@ class Companion:
 
     def __runPixiewps(self, showcmd=False, full_range=False):
         self.__print_with_indicators('*', 'Running Pixiewps…')
+        pixiewps_path = ensure_tool(
+            'pixiewps',
+            'Pixie Dust attack requires the pixiewps utility.'
+        )
+        self.pixie_creds.set_binary(pixiewps_path)
         cmd = self.pixie_creds.get_pixie_cmd(full_range)
         if showcmd:
             print(cmd)
@@ -854,6 +1021,10 @@ class WiFiScanner:
     def __init__(self, interface, vuln_list=None):
         self.interface = interface
         self.vuln_list = vuln_list
+        self.iw_path = ensure_tool(
+            'iw',
+            'The Wi-Fi scanner requires the iw utility.'
+        )
 
         reports_fname = os.path.dirname(os.path.realpath(__file__)) + '/reports/stored.csv'
         try:
@@ -934,7 +1105,7 @@ class WiFiScanner:
             d = result.group(1)
             networks[-1]['Device name'] = codecs.decode(d, 'unicode-escape').encode('latin1').decode('utf-8', errors='replace')
 
-        cmd = 'iw dev {} scan'.format(self.interface)
+        cmd = f"{shlex.quote(self.iw_path)} dev {shlex.quote(self.interface)} scan"
         proc = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, encoding='utf-8', errors='replace')
         lines = proc.stdout.splitlines()
@@ -1123,21 +1294,30 @@ class WiFiScanner:
 
 
 def ifaceUp(iface, down=False):
-    if down:
-        action = 'down'
-    else:
-        action = 'up'
-    cmd = 'ip link set {} {}'.format(iface, action)
-    res = subprocess.run(cmd, shell=True, stdout=sys.stdout, stderr=sys.stdout)
-    if res.returncode == 0:
-        return True
-    else:
-        return False
+    action = 'down' if down else 'up'
+    commands = []
 
+    ip_path = resolve_binary('ip')
+    if ip_path:
+        commands.append(f"{shlex.quote(ip_path)} link set {shlex.quote(iface)} {action}")
 
-def die(msg):
-    sys.stderr.write(msg + '\n')
-    sys.exit(1)
+    ifconfig_path = resolve_binary('ifconfig')
+    if ifconfig_path:
+        commands.append(f"{shlex.quote(ifconfig_path)} {shlex.quote(iface)} {action}")
+
+    if not commands:
+        msg = 'Unable to find either "ip" or "ifconfig" utilities to manage network interfaces.'
+        if IS_TERMUX:
+            msg += ' Install the iproute2 or net-tools packages in Termux.'
+        die(msg)
+
+    for cmd in commands:
+        res = subprocess.run(cmd, shell=True, stdout=sys.stdout, stderr=sys.stdout)
+        if res.returncode == 0:
+            return True
+
+    return False
+
 
 
 def usage():
@@ -1271,8 +1451,7 @@ if __name__ == '__main__':
 
     if sys.hexversion < 0x03060F0:
         die("The program requires Python 3.6 and above")
-    if os.getuid() != 0:
-        die("Run it as root")
+    require_root()
 
     if args.mtk_wifi:
         wmtWifi_device = Path("/dev/wmtWifi")
