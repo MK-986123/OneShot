@@ -558,15 +558,11 @@ class BruteforceStatus:
 
 class Companion:
     """Main application part"""
-    def __init__(self, interface, save_result=False, print_debug=False, bssid=''):
+    def __init__(self, interface, wpa_supplicant_path, save_result=False, print_debug=False, bssid=''):
         self.interface = interface
         self.save_result = save_result
         self.print_debug = print_debug
-
-        self.wpa_supplicant_path = ensure_tool(
-            'wpa_supplicant',
-            'wpa_supplicant is required to communicate with the wireless interface.'
-        )
+        self.wpa_supplicant_path = wpa_supplicant_path
 
         self.tempdir = tempfile.mkdtemp()
         with tempfile.NamedTemporaryFile(mode='w', suffix='.conf', delete=False) as temp:
@@ -1464,9 +1460,15 @@ if __name__ == '__main__':
     if not ifaceUp(args.interface):
         die('Unable to up interface "{}"'.format(args.interface))
 
+    # Validate tool availability before instantiating Companion
+    wpa_supplicant_path = ensure_tool(
+        'wpa_supplicant',
+        'wpa_supplicant is required to communicate with the wireless interface.'
+    )
+
     while True:
         try:
-            companion = Companion(args.interface, args.write, print_debug=args.verbose)
+            companion = Companion(args.interface, wpa_supplicant_path, args.write, print_debug=args.verbose)
             if args.pbc:
                 companion.single_connection(pbc_mode=True)
             else:
@@ -1482,7 +1484,7 @@ if __name__ == '__main__':
                     args.bssid = scanner.prompt_network()
 
                 if args.bssid:
-                    companion = Companion(args.interface, args.write, print_debug=args.verbose)
+                    companion = Companion(args.interface, wpa_supplicant_path, args.write, print_debug=args.verbose)
                     if args.bruteforce:
                         companion.smart_bruteforce(args.bssid, args.pin, args.delay)
                     else:
