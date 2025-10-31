@@ -1021,10 +1021,7 @@ class WiFiScanner:
     def __init__(self, interface, vuln_list=None):
         self.interface = interface
         self.vuln_list = vuln_list
-        self.iw_path = ensure_tool(
-            'iw',
-            'The Wi-Fi scanner requires the iw utility.'
-        )
+        self._iw_path = None
 
         reports_fname = os.path.dirname(os.path.realpath(__file__)) + '/reports/stored.csv'
         try:
@@ -1042,6 +1039,16 @@ class WiFiScanner:
                     )
         except FileNotFoundError:
             self.stored = []
+
+    @property
+    def iw_path(self):
+        """Lazy initialization of iw tool path."""
+        if self._iw_path is None:
+            self._iw_path = ensure_tool(
+                'iw',
+                'The Wi-Fi scanner requires the iw utility.'
+            )
+        return self._iw_path
 
     def iw_scanner(self) -> Dict[int, dict]:
         """Parsing iw scan results"""
